@@ -53,6 +53,7 @@ function log_request()
 {
     echo-with-color green "<--- ${*}" >&2
     return 0
+
 }
 
 function log_reply()
@@ -61,10 +62,28 @@ function log_reply()
     return 0
 }
 
+function log_event()
+{
+    echo-with-color purple "---> ${*}" >&2
+    return 0
+}
+
 
 function reply()
 {
     log_reply $@
+    echo $@
+}
+
+function request()
+{
+    log_request $@
+    echo $@
+}
+
+function event()
+{
+    log_event $@
     echo $@
 }
 
@@ -97,35 +116,7 @@ LEDS["5"]="#ABCDEF"
 LEDS["6"]="#000000"
 LEDS["7"]="#FFFFFF"
 
-
-
-function random_onoff()
-{
-    tmp=$(($RANDOM % 2))
-    [[ $tmp = 0 ]] && echo "ON"
-    [[ $tmp = 1 ]] && echo "OFF"
-}
-
-function random_int()
-{
-    first=${1:-0}
-    last=${2:-10}
-
-    echo $((($RANDOM % $first) + $last))
-}
-
-function send_loop()
-{
-
-    reply SWITCH 4 OFF
-
-    exit 255
-#TODO:
-#generate switch events:
-#SWITCH $ID (ON|OFF)\r\n
-#BUTTON $ID\r\n
-}
-
+export SWITCHES LEDS
 
 function recv_loop()
 {
@@ -166,6 +157,10 @@ function recv_loop()
 	    "VERSION")
 		reply VERSION $VERSION
 		;;
+	    "%SWITCH")
+		SWITCHES["${args[1]}"]="${args[2]}"
+		event SWITCH "${args[1]}" "${args[2]}"
+		;;
             *)
 		err "Unknown command: $args"
 	esac
@@ -174,7 +169,7 @@ function recv_loop()
 
 function main()
 {
-    reply STARTUP mrproper 2342
+    event STARTUP mrproper 2342
     recv_loop
 }
 
