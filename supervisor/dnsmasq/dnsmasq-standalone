@@ -1,0 +1,13 @@
+#!/bin/sh
+
+vlan="$1"
+
+exec dnsmasq --interface="bond0.${vlan}" \
+	     --bind-dynamic \
+	     --filterwin2k \
+	     --bogus-priv \
+	     --addn-hosts=hosts_bond0.${vlan} \
+	     --domain=c3pb.lan \
+	     --dhcp-leasefile="dhcpleases_bond0.${vlan}" \
+	     --dhcp-range=192.168.${vlan}.50,192.168.${vlan}.250,255.255.255.0 \
+             --no-daemon
