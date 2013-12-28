@@ -10,6 +10,7 @@ import re
 import random
 import logging
 import colorsys
+import binascii
 import threading
 import xmlrpclib
 import supervisor.xmlrpc
@@ -24,32 +25,39 @@ log = logging.getLogger("spuelmeister")
 
 COLORS = {
     # switch event ON OFF -> start/stop send to supervisor
-    "COMMAND_ISSUED" : "#EE82EE",
+    "COMMAND_ISSUED" : "#000000",
 
     # switch event ON OFF -> start/stop send to supervisor but threw exception
-    "COMMAND_FAILED" : "#FFFFFF",
+    "COMMAND_FAILED" : "#010101",
 
     "STATE_CHANGE_UNKNOWN" : "#000000",
 
     # supervisord state changes
     # see: http://supervisord.org/subprocess.html#process-states
 
-    "STARTING->RUNNING" : "#FF4500",
-    "STARTING->STOPPING" : "#FFD700",
-    "STARTING->BACKOFF" : "#FF00FF",
+    "UNKNOWN->RUNNING" : "#000100",
+    "UNKNOWN->STOPPED" : "#010000",
+    "UNKNOWN->STARTING" : "#010100",
+    "UNKNOWN->STOPPING" : "#010100",
+    "UNKNOWN->BACKOFF" : "#010001",
+    "UNKNOWN->FATAL" : "#010001",
 
-    "RUNNING->STOPPING" : "#87CEFA",
-    "RUNNING->EXITED" : "#FF00FF",
+    "STARTING->RUNNING" : "#000100",
+    "STOPPING->STOPPED" : "#010000",
 
-    "EXITED->STARTING" : "#FFD700",
-    "FATAL->STARTING" : "#FFD700",
+    "RUNNING->STOPPING" : "#010100",
+    "STOPPED->STARTING" : "#010100",
 
-    "BACKOFF->FATAL" : "#FF1493",
-    "BACKOFF->STARTING" : "#FF1493",
+    "STARTING->STOPPING" : "#010100",
+    "STARTING->BACKOFF" : "#010001",
 
-    "STOPPED->STARTING" : "#FF7F50",
+    "RUNNING->EXITED" : "#010100",
 
-    "STOPPING->STOPPED" : "#DC143C",
+    "EXITED->STARTING" : "#010100",
+    "FATAL->STARTING" : "#010100",
+
+    "BACKOFF->FATAL" : "#010001",
+    "BACKOFF->STARTING" : "#010001",
 }
 
 PROGRAMS = {
@@ -94,7 +102,10 @@ class StartupEvent(MrProperEvent):
         return e
 
     def execute(self, ctx):
-        ctx.mrproper.reset()
+        log.info("Startup: Setting current program states")
+
+        for p in ctx.supervisor.getAllProcessInfo():
+            handle_process_state_change(ctx.mrproper, p["name"], "UNKNOWN", p["statename"])
 
 class SwitchEvent(MrProperEvent):
     regex = re.compile(r'^SWITCH [0-9]+ (ON|OFF)')
@@ -125,6 +136,7 @@ class SwitchEvent(MrProperEvent):
             return
 
         process = PROGRAMS[str(self.switch)]
+        procinfo = None
 
         try:
             procinfo = ctx.supervisor.getProcessInfo(process)
@@ -138,16 +150,17 @@ class SwitchEvent(MrProperEvent):
         try:
             if self.state == "ON":
                 ctx.mrproper.set_led(self.switch, COLORS["COMMAND_ISSUED"])
-                ctx.supervisor.startProcess(process)
+                ctx.supervisor.startProcess(process, False)
 
             elif self.state == "OFF":
                 ctx.mrproper.set_led(self.switch, COLORS["COMMAND_ISSUED"])
-                ctx.supervisor.stopProcess(process)
+                ctx.supervisor.stopProcess(process, False)
+
             else:
                 log.error("wut?")
         except xmlrpclib.Fault, e:
             log.error("Error while setting process state: %s", e)
-            ctx.mrproper.set_led(self.switch, COLORS["COMMAND_FAILED"])
+            handle_process_state_change(ctx.mrproper, process, "UNKNOWN", procinfo["statename"])
 
 
 class ButtonEvent(MrProperEvent):
@@ -179,6 +192,8 @@ class MrProper(Thread):
 
         self._send_lock = threading.RLock()
 
+        self.startup()
+
     def reinitialize(self):
         try:
             for it in iter(self.eventq.get_nowait, None):
@@ -193,7 +208,6 @@ class MrProper(Thread):
             pass
 
         self.serial.flush()
-        self.send()
 
     def run(self):
         self.loop()
@@ -203,7 +217,7 @@ class MrProper(Thread):
             - events
             - replies
         """
-        log.debug("<--- Recvd something: %s", mesg)
+        log.debug("<--- Recvd something: \"%s\" [hex: \"%s\"]", mesg, binascii.hexlify(mesg))
 
         if re.match(self.REPLY_REGEX, mesg):
             log.debug("<--- Something is reply")
@@ -223,7 +237,7 @@ class MrProper(Thread):
         """ Send command to mrproper. Convert args to string."""
 
         cmd = " ".join((str(x) for x in args))
-        log.debug("---> Sending: %s", cmd)
+        log.debug("---> Sending: \"%s\"", cmd)
 
         with self._send_lock:
             print(cmd, file=self.serial)
@@ -243,6 +257,7 @@ class MrProper(Thread):
                 return item
 
             else:
+                log.debug("recv: item \"\" didn't match regex \"\"", item, regex)
                 self.replyq.put(item)
 
     def recv(self, regex, block=True, timeout=5):
@@ -261,10 +276,9 @@ class MrProper(Thread):
     def set_led(self, led, color):
         self.send("LED", led, color)
 
-
     def ping_no_reset(self):
         self.send("PING")
-        return self._recv_no_reset("^PONG", True, 2)
+        return self._recv_no_reset("^PONG", True, 4)
 
     def reset(self):
         log.warning("MrProper reset!")
@@ -275,24 +289,58 @@ class MrProper(Thread):
             log.warning("Waiting for mrproper to respond")
 
         self.send("RESET")
+        time.sleep(5)
 
-        # TODO startup animation
+        self.startup_animation()
 
-        # generate fake events from current switch states
-        switches = self.get_switches()
+    def startup(self):
+        self.send("RESET")
+        self.startup_animation()
 
-        print(switches.itervalues())
-        events = [ SwitchEvent.synthetic(sw, st) for sw, st in switches.iteritems() ]
-        for ev in events:
-            self.eventq.put(ev)
+    def startup_animation(self):
+        anim = ["10000000",
+                "11000000",
+                "11100000",
+                "01110000",
+                "00111000",
+                "00011100",
+                "00001110",
+                "00000111",
+                "00000011",
+                "00000001",
+                "00000011",
+                "00000111",
+                "00001110",
+                "00011100",
+                "00111000",
+                "01110000",
+                "11100000",
+                "11000000",
+                "10000000" ]
+
+        for ignore in range(0, 2):
+            for frm in anim:
+                for i, px in enumerate(frm):
+                    self.set_led(i, ["#050000", "#000101"][int(px)])
+
+        for color in ["#010101",
+                      "#010100"]:
+
+            for led in range(0, 8):
+                self.set_led(led, color)
+                time.sleep(0.1)
+
+        time.sleep(1)
+
+        for led in range(0, 8):
+            self.set_led(led, "#000000")
 
     def ping(self, block=True, timeout=5):
         """special: wait only 5 seconds for PONG"""
         self.send("PING")
         res = self.recv("^PONG", block, timeout)
 
-        if res:
-            return res.split()[1]
+        return res != None
 
     def version(self):
         self.send("VERSION")
@@ -336,21 +384,6 @@ class EventProcessor(Thread):
             log.debug("Executing event: %s", ev)
             ev.execute(self.ctx)
 
-class MrProperPingPong(Thread):
-    def __init__(self, mrproper, interval=5):
-        Thread.__init__(self)
-        self.daemon = True
-        self.mrproper = mrproper
-        self.interval = interval
-
-    def run(self):
-        while True:
-            self.mrproper.ping()
-            time.sleep(self.interval)
-            # XXX handle no pong in $time!
-            # back to startup()?
-
-
 def setup_logger():
     logf = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -371,7 +404,6 @@ def connect_supervisor():
                                 transport=supervisor.xmlrpc.SupervisorTransport(
                                     None, None, 'unix:////srv/spuelmeister/supervisor/supervisor.sock' ))
 
-
     return sup.supervisor
 
 
@@ -384,20 +416,6 @@ def check_supervisor_rpc_con(sup):
     for p in PROGRAMS.itervalues():
         if not p in all_proc:
             log.error("Program \"%s\" unknown to supervisor", p)
-
-class MrProperDoShit(Thread):
-    def __init__(self, mrproper, interval=5):
-        Thread.__init__(self)
-        self.daemon = True
-        self.mrproper = mrproper
-        self.interval = interval
-
-    def run(self):
-        while True:
-            self.mrproper.send("%SWITCH {} {}".format(str(random.randint(0,7)), random.choice(("ON","OFF"))))
-            log.debug("Current switches: %s", self.mrproper.get_switches())
-            time.sleep(self.interval)
-
 
 def handle_process_state_change(mp, proc, frm, to):
     if not SWITCHES.has_key(proc):
@@ -421,7 +439,7 @@ def supervisor_event_listener(sup, mrproper):
         headers, payload = childutils.listener.wait()
 
         if headers["eventname"].startswith("TICK"):
-            if not mrproper.ping() == "PONG":
+            if not mrproper.ping():
                 mrproper.reset()
 
         elif headers["eventname"].startswith("PROCESS_STATE"):
@@ -439,7 +457,7 @@ def supervisor_event_listener(sup, mrproper):
 def main():
     setup_logger()
 
-    s = serial.Serial("/dev/ttyS1", 115200)
+    s = serial.Serial("/dev/ttyACM0", 57600)
 
     sup = connect_supervisor()
     check_supervisor_rpc_con(sup)
@@ -449,10 +467,6 @@ def main():
 
     eproc = EventProcessor(m, sup)
     eproc.start()
-
-
-    shit = MrProperDoShit(m, interval=2)
-    shit.start()
 
     supervisor_event_listener(sup, m)
 
